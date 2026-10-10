@@ -1,0 +1,22 @@
+What:           /sys/bus/platform/devices/.../output_enable
+Date:           October 2026
+Contact:        Inkwell project maintainers
+Description:
+                Opt-in FRDM i.MX93 EPD bench output lease. Present only with
+                inkwell,manual-output-enable on the parallel display formatter.
+                That property requires pinctrl states default and gpio to map
+                all routed signals to GPIO output-low hogs, and active to map
+                them to LCDIF. The legacy default/gpio behavior is unchanged
+                when the property is absent.
+
+                Read: 0 = parked, 1 = output lease active. Write 1 to enable
+                or renew a two-second lease, only while the DRM encoder is
+                active. Write 0 to park immediately. Timeout, DRM disable,
+                unbind and orderly host shutdown park the pins and cancel
+                the lease. A modeset never automatically restores a lease.
+                Timeout is workqueue scheduled, not a hard real-time deadline.
+
+                Root-only writes. The caller must establish logic power and
+                exclusive ownership before enabling. This interface neither
+                sequences nor measures PMIC rails. It is for panel-disconnected
+                electrical tests; it does not implement panel shutdown timing.
