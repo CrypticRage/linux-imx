@@ -29,6 +29,11 @@
 
 #define DRIVER_NAME "imx-lpi2c"
 
+/* Disabled by default; adapter-specific, temporary bench diagnostics. */
+static int lpi2c_diag_bus = -1;
+module_param_named(diagnostic_bus, lpi2c_diag_bus, int, 0644);
+MODULE_PARM_DESC(diagnostic_bus, "Log LPI2C state for this bus number (-1 disables)");
+
 #define LPI2C_PARAM	0x04	/* i2c RX/TX FIFO size */
 #define LPI2C_MCR	0x10	/* i2c contrl register */
 #define LPI2C_MSR	0x14	/* i2c status register */
@@ -176,6 +181,7 @@ struct lpi2c_imx_dma {
 
 struct lpi2c_imx_struct {
 	struct i2c_adapter	adapter;
+	u64			diag_seq;
 	int			num_clks;
 	struct clk_bulk_data	*clks;
 	void __iomem		*base;
@@ -221,6 +227,41 @@ static void lpi2c_imx_intctrl(struct lpi2c_imx_struct *lpi2c_imx,
 	writel(enable, lpi2c_imx->base + LPI2C_MIER);
 }
 
+/*
+ * Read only control/status registers while runtime clocks are enabled. Never
+ * read RX/TX data registers: that would consume data or have side effects.
+ * Values are sequential samples, not an atomic hardware snapshot. poll_msr
+ * preserves the timeout poll value before existing recovery can change it.
+ */
+static void lpi2c_imx_diag(struct lpi2c_imx_struct *lpi2c_imx,
+			 const char *stage, int result, u32 poll_msr)
+{
+	u32 mcr, msr, mier, mder, cfg1, cfg2, cfg3, fsr, scr, ssr;
+
+	if (READ_ONCE(lpi2c_diag_bus) != lpi2c_imx->adapter.nr)
+		return;
+
+	mcr = readl(lpi2c_imx->base + LPI2C_MCR);
+	msr = readl(lpi2c_imx->base + LPI2C_MSR);
+	mier = readl(lpi2c_imx->base + LPI2C_MIER);
+	mder = readl(lpi2c_imx->base + LPI2C_MDER);
+	cfg1 = readl(lpi2c_imx->base + LPI2C_MCFGR1);
+	cfg2 = readl(lpi2c_imx->base + LPI2C_MCFGR2);
+	cfg3 = readl(lpi2c_imx->base + LPI2C_MCFGR3);
+	fsr = readl(lpi2c_imx->base + LPI2C_MFSR);
+	scr = readl(lpi2c_imx->base + LPI2C_SCR);
+	ssr = readl(lpi2c_imx->base + LPI2C_SSR);
+
+	dev_info(&lpi2c_imx->adapter.dev,
+		 "diag seq=%llu stage=%s result=%d poll_msr=%08x MCR=%08x MSR=%08x MIER=%08x MDER=%08x\n",
+		 (unsigned long long)lpi2c_imx->diag_seq, stage, result,
+		 poll_msr, mcr, msr, mier, mder);
+	dev_info(&lpi2c_imx->adapter.dev,
+		 "diag seq=%llu stage=%s MCFGR1=%08x MCFGR2=%08x MCFGR3=%08x MFSR=%08x SCR=%08x SSR=%08x\n",
+		 (unsigned long long)lpi2c_imx->diag_seq, stage,
+		 cfg1, cfg2, cfg3, fsr, scr, ssr);
+}
+
 static int lpi2c_imx_bus_busy(struct lpi2c_imx_struct *lpi2c_imx, bool atomic)
 {
 	unsigned int temp;
@@ -237,6 +278,7 @@ static int lpi2c_imx_bus_busy(struct lpi2c_imx_struct *lpi2c_imx, bool atomic)
 
 	/* check for bus not busy */
 	if (err) {
+		lpi2c_imx_diag(lpi2c_imx, "start-timeout", err, temp);
 		dev_dbg(&lpi2c_imx->adapter.dev, "bus not work\n");
 		if (lpi2c_imx->adapter.bus_recovery_info)
 			i2c_recover_bus(&lpi2c_imx->adapter);
@@ -291,11 +333,13 @@ static void lpi2c_imx_stop(struct lpi2c_imx_struct *lpi2c_imx, bool atomic)
 	unsigned int temp;
 	int err;
 
+	lpi2c_imx_diag(lpi2c_imx, "before-stop", 0, 0);
 	writel(GEN_STOP << 8, lpi2c_imx->base + LPI2C_MTDR);
 
 	err = lpi2c_imx_read_msr_poll_timeout(atomic, temp, temp & MSR_SDF);
 
 	if (err) {
+		lpi2c_imx_diag(lpi2c_imx, "stop-timeout", err, temp);
 		dev_dbg(&lpi2c_imx->adapter.dev, "stop timeout\n");
 		if (lpi2c_imx->adapter.bus_recovery_info)
 			i2c_recover_bus(&lpi2c_imx->adapter);
@@ -372,6 +416,7 @@ static int lpi2c_imx_master_enable(struct lpi2c_imx_struct *lpi2c_imx)
 	if (ret < 0)
 		return ret;
 
+	lpi2c_imx_diag(lpi2c_imx, "before-master-reset", 0, 0);
 	temp = MCR_RST;
 	writel(temp, lpi2c_imx->base + LPI2C_MCR);
 	writel(0, lpi2c_imx->base + LPI2C_MCR);
@@ -383,6 +428,7 @@ static int lpi2c_imx_master_enable(struct lpi2c_imx_struct *lpi2c_imx)
 	temp = readl(lpi2c_imx->base + LPI2C_MCR);
 	temp |= MCR_MEN;
 	writel(temp, lpi2c_imx->base + LPI2C_MCR);
+	lpi2c_imx_diag(lpi2c_imx, "master-enabled", 0, 0);
 
 	return 0;
 
@@ -399,6 +445,7 @@ static int lpi2c_imx_master_disable(struct lpi2c_imx_struct *lpi2c_imx)
 	temp = readl(lpi2c_imx->base + LPI2C_MCR);
 	temp &= ~MCR_MEN;
 	writel(temp, lpi2c_imx->base + LPI2C_MCR);
+	lpi2c_imx_diag(lpi2c_imx, "master-disabled-before-clock-gate", 0, 0);
 
 	pm_runtime_put_autosuspend(lpi2c_imx->adapter.dev.parent);
 
@@ -410,6 +457,9 @@ static int lpi2c_imx_pio_msg_complete(struct lpi2c_imx_struct *lpi2c_imx)
 	unsigned long time_left;
 
 	time_left = wait_for_completion_timeout(&lpi2c_imx->complete, HZ);
+
+	if (!time_left)
+		lpi2c_imx_diag(lpi2c_imx, "pio-timeout", -ETIMEDOUT, 0);
 
 	return time_left ? 0 : -ETIMEDOUT;
 }
@@ -428,6 +478,7 @@ static int lpi2c_imx_txfifo_empty(struct lpi2c_imx_struct *lpi2c_imx, bool atomi
 	}
 
 	if (err) {
+		lpi2c_imx_diag(lpi2c_imx, "txfifo-timeout", err, temp);
 		dev_dbg(&lpi2c_imx->adapter.dev, "txfifo empty timeout\n");
 		if (lpi2c_imx->adapter.bus_recovery_info)
 			i2c_recover_bus(&lpi2c_imx->adapter);
@@ -1114,14 +1165,19 @@ static int lpi2c_imx_xfer_common(struct i2c_adapter *adapter,
 	unsigned int temp;
 	int i, result;
 
+	if (READ_ONCE(lpi2c_diag_bus) == adapter->nr)
+		lpi2c_imx->diag_seq++;
+
 	result = lpi2c_imx_master_enable(lpi2c_imx);
 	if (result)
 		return result;
 
 	for (i = 0; i < num; i++) {
 		result = lpi2c_imx_start(lpi2c_imx, &msgs[i], atomic);
-		if (result)
+		if (result) {
+			lpi2c_imx_diag(lpi2c_imx, "start-error", result, 0);
 			goto disable;
+		}
 
 		/* quick smbus */
 		if (num == 1 && msgs[0].len == 0)
@@ -1157,6 +1213,7 @@ static int lpi2c_imx_xfer_common(struct i2c_adapter *adapter,
 	}
 
 stop:
+	lpi2c_imx_diag(lpi2c_imx, "transfer-before-stop", result, 0);
 	lpi2c_imx_stop(lpi2c_imx, atomic);
 
 	temp = readl(lpi2c_imx->base + LPI2C_MSR);
@@ -1164,6 +1221,7 @@ stop:
 		result = -EIO;
 
 disable:
+	lpi2c_imx_diag(lpi2c_imx, "transfer-before-disable", result, 0);
 	lpi2c_imx_master_disable(lpi2c_imx);
 
 	dev_dbg(&lpi2c_imx->adapter.dev, "<%s> exit with: %s: %d\n", __func__,
