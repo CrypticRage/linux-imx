@@ -41,7 +41,7 @@ struct lcdifv3_crtc {
 
 	int vbl_irq;
 	u32 pix_fmt;		/* drm fourcc */
- bool epd_opt_in;
+ bool epd_opt_in, epd_fault_opt_in, epd_irq_stalled, epd_forced_stop;
  spinlock_t epd_lock;
  struct work_struct epd_release;
  struct delayed_work epd_watchdog;
@@ -290,7 +290,8 @@ static void lcdifv3_epd_force_stop(struct lcdifv3_crtc *ctx)
  unsigned long flags;
  spin_lock_irqsave(&ctx->epd_lock, flags);
  if (ctx->epd_plan && ctx->epd_state == IMX_EPD_RUNNING) {
-  ctx->epd_error = -ESHUTDOWN;ctx->epd_valid = false;
+  if (!ctx->epd_error) ctx->epd_error = -ESHUTDOWN;
+  ctx->epd_valid = false;
   lcdifv3_epd_finish(ctx, IMX_EPD_FAULT);
  }
  spin_unlock_irqrestore(&ctx->epd_lock, flags);
@@ -302,9 +303,10 @@ static irqreturn_t lcdifv3_crtc_vblank_irq_handler(int irq, void *dev_id)
 	struct lcdifv3_soc *lcdifv3 = dev_get_drvdata(lcdifv3_crtc->dev->parent);
 
  u32 status = lcdifv3_irq_status(lcdifv3);
+ u32 effective = READ_ONCE(lcdifv3_crtc->epd_irq_stalled) ? status & ~BIT(2) : status;
  struct drm_crtc *crtc = &lcdifv3_crtc->base;
  if (!status) return IRQ_NONE;
- if (status & BIT(2)) {
+ if (effective & BIT(2)) {
   drm_crtc_handle_vblank(crtc);
   spin_lock(&crtc->dev->event_lock);
   if (lcdifv3_crtc->pending_event && !lcdifv3_shadow_pending(lcdifv3)) {
@@ -314,7 +316,7 @@ static irqreturn_t lcdifv3_crtc_vblank_irq_handler(int irq, void *dev_id)
   }
   spin_unlock(&crtc->dev->event_lock);
  }
- lcdifv3_epd_tick(lcdifv3_crtc, status);
+ lcdifv3_epd_tick(lcdifv3_crtc, effective);
  lcdifv3_irq_ack(lcdifv3, status);
 
 	return IRQ_HANDLED;
@@ -431,6 +433,7 @@ static int lcdifv3_crtc_probe(struct platform_device *pdev)
  INIT_WORK(&lcdifv3_crtc->epd_release, lcdifv3_epd_release_work);
  INIT_DELAYED_WORK(&lcdifv3_crtc->epd_watchdog, lcdifv3_epd_watchdog);
  lcdifv3_crtc->epd_opt_in = of_property_read_bool(dev->parent->of_node, "inkwell,finite-scanout");
+ lcdifv3_crtc->epd_fault_opt_in = of_property_read_bool(dev->parent->of_node, "inkwell,disconnected-fault-tests");
 	dev_set_drvdata(dev, lcdifv3_crtc);
 
 	return component_add(dev, &lcdifv3_crtc_ops);

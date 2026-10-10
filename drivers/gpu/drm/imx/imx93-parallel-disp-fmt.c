@@ -17,6 +17,8 @@
 #include <drm/imx-epd.h>
 #include <linux/regmap.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_device.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_of.h>
 #include <drm/drm_simple_kms_helper.h>
@@ -47,6 +49,7 @@ struct imx93_pdf {
 	bool ready;
 	bool encoder_active;
 	bool output_enabled;
+	bool fault_parked;
 	struct mutex output_lock;
 	struct delayed_work output_timeout;
 };
@@ -124,7 +127,7 @@ static ssize_t output_enable_store(struct device *dev,
 		ret = -ENODEV;
 	} else if (!enable) {
 		ret = imx93_pdf_park(pdf);
-	} else if (!pdf->encoder_active) {
+	} else if (!pdf->encoder_active || pdf->fault_parked) {
 		ret = -EPIPE;
 	} else {
 		ret = 0;
@@ -149,6 +152,7 @@ static void imx93_pdf_encoder_enable(struct drm_encoder *encoder)
 	regmap_update_bits(pdf->regmap, DISPLAY_MUX_CTRL, PARALLEL_DISP_FORMAT,
 			   pdf->format);
 	pdf->encoder_active = true;
+	pdf->fault_parked = false;
 	if (pdf->manual_output)
 		imx93_pdf_park(pdf);
 	else
@@ -208,6 +212,30 @@ static const struct drm_encoder_helper_funcs imx93_pdf_encoder_helper_funcs = {
 	.enable = imx93_pdf_encoder_enable,
 	.disable = imx93_pdf_encoder_disable,
 };
+
+/* Caller holds DRM modeset locks; park before an emergency controller stop. */
+int imx93_epd_park_outputs(struct drm_crtc *crtc)
+{
+ struct drm_encoder *encoder;
+ struct imx93_pdf *pdf;
+ int ret;
+ drm_for_each_encoder(encoder, crtc->dev) {
+  if (encoder->crtc != crtc || encoder->helper_private != &imx93_pdf_encoder_helper_funcs)
+   continue;
+  pdf = enc_to_pdf(encoder);
+  mutex_lock(&pdf->output_lock);
+  if (!pdf->manual_output || !pdf->ready || !pdf->gpio_state)
+   ret = -EOPNOTSUPP;
+  else {
+   pdf->fault_parked = true;
+   ret = imx93_pdf_park(pdf);
+  }
+  mutex_unlock(&pdf->output_lock);
+  return ret;
+ }
+ return -ENODEV;
+}
+EXPORT_SYMBOL_GPL(imx93_epd_park_outputs);
 
 static int imx93_pdf_register(struct drm_device *drm, struct imx93_pdf *pdf)
 {
