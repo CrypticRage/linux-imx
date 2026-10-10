@@ -5,7 +5,7 @@ struct lcdifv3_epd_plan {
 	u32 addr[IMX_EPD_MAX_PHASES], idle_addr, scans[IMX_EPD_MAX_PHASES];
 	u32 phases, total, remaining;
 	int active, pending;
-	bool started, abort;
+	bool started, abort, injected;
 	struct file *drm_file, *lock_file;
 };
 
@@ -57,6 +57,38 @@ static void lcdifv3_epd_finish(struct lcdifv3_crtc *ctx, u32 state)
 	schedule_work(&ctx->epd_release);
 }
 
+static void lcdifv3_epd_fault(struct lcdifv3_crtc *ctx, int error)
+{
+	ctx->epd_error = error;
+	ctx->epd_valid = false;
+	ctx->epd_plan->abort = true;
+	lcdifv3_epd_program(ctx, -1);
+}
+
+/* Requires epd_lock and the same root DRM master/queue generation. A second
+ * explicit DT opt-in restricts this to the disconnected, HV-off bench. */
+static int lcdifv3_epd_inject(struct lcdifv3_crtc *ctx, u32 kind)
+{
+	struct lcdifv3_epd_plan *p = ctx->epd_plan;
+	if (!ctx->epd_fault_opt_in || !IS_BUILTIN(CONFIG_DRM_IMX93_PARALLEL_DISPLAY_FORMAT))
+		return -EOPNOTSUPP;
+	if (!p || ctx->epd_state != IMX_EPD_RUNNING || !p->started || p->active < 0 || p->injected)
+		return -EBUSY;
+	if (kind != IMX_EPD_INJECT_UNDERRUN && kind != IMX_EPD_INJECT_STALL)
+		return -EINVAL;
+	p->injected = true;
+	if (kind == IMX_EPD_INJECT_UNDERRUN) {
+		/* Exercise the same policy as a latched underrun, not physical starvation. */
+		lcdifv3_epd_fault(ctx, -EIO);
+	} else {
+		/* Real interrupt-progress loss; keep DMA running to test the watchdog. */
+		ctx->epd_irq_stalled = true;
+		ctx->epd_valid = false;
+		lcdifv3_vblank_irq_disable(dev_get_drvdata(ctx->dev->parent));
+	}
+	return 0;
+}
+
 /* Called at VS_BLANK, after the old frame's active pixels finished. FPV
  * fetch/shadow load is selected in this BSP. A cleared load bit acknowledges
  * the framebuffer selected for the next active interval. */
@@ -69,13 +101,13 @@ static void lcdifv3_epd_tick(struct lcdifv3_crtc *ctx, u32 irq_status)
 	int old;
 	spin_lock_irqsave(&ctx->epd_lock, flags);
 	p = ctx->epd_plan;
+	/* Also mask an IRQ that was already in flight when injection acquired the lock. */
+	if (READ_ONCE(ctx->epd_irq_stalled))
+		irq_status &= ~BIT(2);
 	if (!p || ctx->epd_state != IMX_EPD_RUNNING)
 		goto out;
 	if (irq_status & (BIT(1) | BIT(8) | BIT(24))) {
-		ctx->epd_error = -EIO;
-		ctx->epd_valid = false;
-		p->abort = true;
-		lcdifv3_epd_program(ctx, -1);
+		lcdifv3_epd_fault(ctx, -EIO);
 		goto out;
 	}
 	if (!(irq_status & BIT(2)))
@@ -126,17 +158,32 @@ out:
 	spin_unlock_irqrestore(&ctx->epd_lock, flags);
 }
 
-/* Emergency bounded teardown if acknowledgments stop entirely. Controller
- * stop is not a clean pin transition. The existing GPIO lease parks outputs;
- * this path is restricted to the disconnected, HV-off bench configuration. */
+/* Emergency teardown does not guarantee a whole last scan. Park pins before
+ * disabling DMA/display so a frozen output word cannot stay asserted. */
 static void lcdifv3_epd_watchdog(struct work_struct *work)
 {
 	struct lcdifv3_crtc *ctx =
 	    container_of(to_delayed_work(work), struct lcdifv3_crtc, epd_watchdog);
 	struct drm_device *drm = ctx->base.dev;
+	struct lcdifv3_soc *lcdif = dev_get_drvdata(ctx->dev->parent);
+	unsigned long flags;
+	int ret = -EOPNOTSUPP;
 	drm_modeset_lock_all(drm);
 	if (READ_ONCE(ctx->epd_until)) {
-		lcdifv3_disable_controller(dev_get_drvdata(ctx->dev->parent));
+#if IS_BUILTIN(CONFIG_DRM_IMX93_PARALLEL_DISPLAY_FORMAT)
+		ret = imx93_epd_park_outputs(&ctx->base);
+#endif
+		spin_lock_irqsave(&ctx->epd_lock, flags);
+		if (!ctx->epd_error)
+			ctx->epd_error = ret ? ret : -ETIMEDOUT;
+		ctx->epd_valid = false;
+		ctx->epd_forced_stop = true;
+		spin_unlock_irqrestore(&ctx->epd_lock, flags);
+		lcdifv3_disable_controller(lcdif);
+		if (ctx->epd_irq_stalled) {
+			ctx->epd_irq_stalled = false;
+			lcdifv3_vblank_irq_enable(lcdif);
+		}
 		lcdifv3_epd_force_stop(ctx);
 	}
 	drm_modeset_unlock_all(drm);
@@ -177,7 +224,7 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 	struct drm_display_mode *mode;
 	unsigned long flags;
 	int ret = 0, i;
-	if (arg->version != IMX_EPD_VERSION || arg->flags || arg->command > IMX_EPD_CAPS)
+	if (arg->version != IMX_EPD_VERSION || arg->flags || arg->command > IMX_EPD_INJECT)
 		return -EINVAL;
 	drm_for_each_crtc(crtc, drm)
 	{
@@ -191,6 +238,10 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 	if (arg->command == IMX_EPD_CAPS) {
 		arg->num_phases = IMX_EPD_MAX_PHASES;
 		arg->completed_scans = IMX_EPD_MAX_SCANS;
+		arg->flags =
+		    ctx->epd_fault_opt_in && IS_BUILTIN(CONFIG_DRM_IMX93_PARALLEL_DISPLAY_FORMAT)
+			? IMX_EPD_CAP_FAULT_TESTS
+			: 0;
 		return 0;
 	}
 	if (arg->command != IMX_EPD_SUBMIT) {
@@ -200,6 +251,8 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 		else if (arg->command == IMX_EPD_ABORT && ctx->epd_plan &&
 			 ctx->epd_state == IMX_EPD_RUNNING)
 			ctx->epd_plan->abort = true;
+		else if (arg->command == IMX_EPD_INJECT)
+			ret = lcdifv3_epd_inject(ctx, arg->num_phases);
 		goto report;
 	}
 	if (!arg->num_phases || arg->num_phases > IMX_EPD_MAX_PHASES || arg->lock_fd < 0)
@@ -274,6 +327,8 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 	ctx->epd_completed = 0;
 	ctx->epd_error = 0;
 	ctx->epd_valid = true;
+	ctx->epd_forced_stop = false;
+	ctx->epd_irq_stalled = false;
 	ctx->epd_period = 15747000;
 	ctx->epd_last_irq = 0;
 	ctx->epd_arm_time = ktime_get_ns();
@@ -288,7 +343,9 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 report:
 	arg->generation = ctx->epd_generation;
 	arg->status = ctx->epd_state;
-	arg->flags = ctx->epd_plan != NULL || work_busy(&ctx->epd_release);
+	arg->flags =
+	    (ctx->epd_plan != NULL || work_busy(&ctx->epd_release) ? IMX_EPD_REFS_HELD : 0) |
+	    (ctx->epd_forced_stop ? IMX_EPD_CONTROLLER_STOPPED : 0);
 	arg->completed_scans = ctx->epd_completed;
 	arg->error = ctx->epd_error;
 	arg->count_valid = ctx->epd_valid;

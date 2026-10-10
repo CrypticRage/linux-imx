@@ -7,4 +7,5 @@ struct drm_file;
 struct drm_crtc;
 int lcdifv3_epd_ioctl(struct drm_device *, void *, struct drm_file *);
 u64 lcdifv3_epd_deadline_ns(struct drm_crtc *);
+int imx93_epd_park_outputs(struct drm_crtc *);
 #endif
