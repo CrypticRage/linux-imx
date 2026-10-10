@@ -124,7 +124,9 @@ static int lcdifv3_crtc_atomic_check(struct drm_crtc *crtc,
 static void lcdifv3_crtc_atomic_begin(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
-	drm_crtc_vblank_on(crtc);
+	/* vblank_on resets the count for a modeset, not a plane-only flip. */
+	if (drm_atomic_crtc_needs_modeset(crtc->state))
+		drm_crtc_vblank_on(crtc);
 
 	spin_lock_irq(&crtc->dev->event_lock);
 	if (crtc->state->event) {
