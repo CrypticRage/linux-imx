@@ -786,3 +786,31 @@ module_platform_driver(imx_lcdifv3_driver);
 MODULE_DESCRIPTION("NXP i.MX LCDIFV3 Display Controller driver");
 MODULE_AUTHOR("Fancy Fang <chen.fang@nxp.com>");
 MODULE_LICENSE("GPL");
+
+/* Shadow completion and error status used by the experimental finite queue. */
+bool lcdifv3_shadow_pending(struct lcdifv3_soc *lcdifv3)
+{
+ return !!(readl(lcdifv3->base + LCDIFV3_CTRLDESCL0_5) & CTRLDESCL0_5_SHADOW_LOAD_EN);
+}
+EXPORT_SYMBOL_GPL(lcdifv3_shadow_pending);
+u32 lcdifv3_irq_status(struct lcdifv3_soc *lcdifv3)
+{
+ return readl(lcdifv3->base + LCDIFV3_INT_STATUS_D0);
+}
+EXPORT_SYMBOL_GPL(lcdifv3_irq_status);
+void lcdifv3_irq_ack(struct lcdifv3_soc *lcdifv3, u32 status)
+{
+ writel(status, lcdifv3->base + LCDIFV3_INT_STATUS_D0);
+}
+EXPORT_SYMBOL_GPL(lcdifv3_irq_ack);
+void lcdifv3_epd_error_irqs(struct lcdifv3_soc *lcdifv3, bool enable)
+{
+ u32 mask = INT_STATUS_D0_UNDERRUN | INT_STATUS_D0_DMA_ERR | INT_STATUS_D0_FIFO_EMPTY;
+ u32 value = readl(lcdifv3->base + LCDIFV3_INT_ENABLE_D0);
+ if (enable) {
+  writel(mask, lcdifv3->base + LCDIFV3_INT_STATUS_D0);
+  value |= mask;
+ } else value &= ~mask;
+ writel(value, lcdifv3->base + LCDIFV3_INT_ENABLE_D0);
+}
+EXPORT_SYMBOL_GPL(lcdifv3_epd_error_irqs);

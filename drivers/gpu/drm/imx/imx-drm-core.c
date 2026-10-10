@@ -30,6 +30,7 @@
 
 #include "dpu/dpu-blit.h"
 #include "imx-drm.h"
+#include <drm/imx-epd.h>
 
 static int legacyfb_depth = 16;
 module_param(legacyfb_depth, int, 0444);
@@ -59,8 +60,17 @@ int imx_drm_encoder_parse_of(struct drm_device *drm,
 }
 EXPORT_SYMBOL_GPL(imx_drm_encoder_parse_of);
 
+static int imx_drm_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *file)
+{
+#if IS_BUILTIN(CONFIG_DRM_IMX_LCDIFV3)
+ return lcdifv3_epd_ioctl(drm, data, file);
+#else
+ return -EOPNOTSUPP;
+#endif
+}
+
 static const struct drm_ioctl_desc imx_drm_ioctls[] = {
-	/* none so far */
+ DRM_IOCTL_DEF_DRV(IMX_EPD_SEQUENCE, imx_drm_epd_ioctl, DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY),
 };
 
 static int imx_drm_ipu_dumb_create(struct drm_file *file_priv,
