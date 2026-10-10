@@ -13,6 +13,8 @@
 #include <linux/of.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
+#include <linux/ktime.h>
+#include <drm/imx-epd.h>
 #include <linux/regmap.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
@@ -77,8 +79,17 @@ static void imx93_pdf_output_timeout(struct work_struct *work)
 					    struct imx93_pdf, output_timeout);
 
 	mutex_lock(&pdf->output_lock);
-	if (pdf->ready)
-		imx93_pdf_park(pdf);
+	if (pdf->ready) {
+#if IS_BUILTIN(CONFIG_DRM_IMX_LCDIFV3)
+  u64 until = lcdifv3_epd_deadline_ns(pdf->encoder.crtc);
+  if (until && ktime_get_ns() < until) {
+   mod_delayed_work(system_wq, &pdf->output_timeout, msecs_to_jiffies(100));
+   mutex_unlock(&pdf->output_lock);
+   return;
+  }
+#endif
+  imx93_pdf_park(pdf);
+ }
 	mutex_unlock(&pdf->output_lock);
 }
 

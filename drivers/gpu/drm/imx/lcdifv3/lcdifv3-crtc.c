@@ -4,6 +4,18 @@
  */
 
 #include <linux/component.h>
+#include <linux/of.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/ktime.h>
+#include <linux/uaccess.h>
+#include <linux/workqueue.h>
+#include <drm/drm_file.h>
+#include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_modeset_lock.h>
+#include <drm/imx-epd.h>
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/media-bus-format.h>
@@ -29,9 +41,21 @@ struct lcdifv3_crtc {
 
 	int vbl_irq;
 	u32 pix_fmt;		/* drm fourcc */
+ bool epd_opt_in;
+ spinlock_t epd_lock;
+ struct work_struct epd_release;
+ struct delayed_work epd_watchdog;
+ struct lcdifv3_epd_plan *epd_plan;
+ u64 epd_until, epd_generation, epd_owner, epd_period, epd_last_irq, epd_arm_time;
+ u32 epd_state, epd_completed;
+ int epd_error;
+ bool epd_valid;
+ struct drm_pending_vblank_event *pending_event;
 };
 
 #define to_lcdifv3_crtc(crtc) container_of(crtc, struct lcdifv3_crtc, base)
+
+static void lcdifv3_epd_force_stop(struct lcdifv3_crtc *ctx);
 
 static void lcdifv3_crtc_reset(struct drm_crtc *crtc)
 {
@@ -90,6 +114,11 @@ static int lcdifv3_crtc_atomic_check(struct drm_crtc *crtc,
 									  crtc);
 	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc_state);
 
+ if (READ_ONCE(lcdifv3_crtc->epd_until) && crtc_state->active)
+  return -EBUSY;
+ if (READ_ONCE(lcdifv3_crtc->pending_event) && crtc_state->active)
+  return -EBUSY;
+
 	/* Don't check 'bus_format' when CRTC is
 	 * going to be disabled.
 	 */
@@ -128,13 +157,6 @@ static void lcdifv3_crtc_atomic_begin(struct drm_crtc *crtc,
 	if (drm_atomic_crtc_needs_modeset(crtc->state))
 		drm_crtc_vblank_on(crtc);
 
-	spin_lock_irq(&crtc->dev->event_lock);
-	if (crtc->state->event) {
-		WARN_ON(drm_crtc_vblank_get(crtc));
-		drm_crtc_arm_vblank_event(crtc, crtc->state->event);
-		crtc->state->event = NULL;
-	}
-	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
 static void lcdifv3_crtc_atomic_flush(struct drm_crtc *crtc,
@@ -143,8 +165,19 @@ static void lcdifv3_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct lcdifv3_crtc *lcdifv3_crtc = to_lcdifv3_crtc(crtc);
 	struct lcdifv3_soc *lcdifv3 = dev_get_drvdata(lcdifv3_crtc->dev->parent);
 
-	/* kick shadow load for plane config */
-	lcdifv3_en_shadow_load(lcdifv3);
+ /* Publish the complete register update and event under the same IRQ lock.
+  * The IRQ sends completion only after hardware clears SHADOW_LOAD_EN. */
+ spin_lock_irq(&crtc->dev->event_lock);
+ lcdifv3_en_shadow_load(lcdifv3);
+ if (crtc->state->event) {
+  if (drm_crtc_vblank_get(crtc) == 0) {
+   lcdifv3_crtc->pending_event = crtc->state->event;
+  } else {
+   drm_crtc_send_vblank_event(crtc, crtc->state->event);
+  }
+  crtc->state->event = NULL;
+ }
+ spin_unlock_irq(&crtc->dev->event_lock);
 }
 
 static void lcdifv3_crtc_atomic_enable(struct drm_crtc *crtc,
@@ -196,11 +229,17 @@ static void lcdifv3_crtc_atomic_disable(struct drm_crtc *crtc,
 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
 		crtc->state->event = NULL;
 	}
+ if (lcdifv3_crtc->pending_event) {
+  drm_crtc_send_vblank_event(crtc, lcdifv3_crtc->pending_event);
+  lcdifv3_crtc->pending_event = NULL;
+  drm_crtc_vblank_put(crtc);
+ }
 	spin_unlock_irq(&crtc->dev->event_lock);
 
 	drm_crtc_vblank_off(crtc);
 
 	lcdifv3_disable_controller(lcdifv3);
+ lcdifv3_epd_force_stop(lcdifv3_crtc);
 
 	pm_runtime_put(lcdifv3_crtc->dev->parent);
 }
@@ -244,14 +283,39 @@ static const struct drm_crtc_funcs lcdifv3_crtc_funcs = {
 	.disable_vblank = lcdifv3_disable_vblank,
 };
 
+#include "lcdifv3-epd.h"
+
+static void lcdifv3_epd_force_stop(struct lcdifv3_crtc *ctx)
+{
+ unsigned long flags;
+ spin_lock_irqsave(&ctx->epd_lock, flags);
+ if (ctx->epd_plan && ctx->epd_state == IMX_EPD_RUNNING) {
+  ctx->epd_error = -ESHUTDOWN;ctx->epd_valid = false;
+  lcdifv3_epd_finish(ctx, IMX_EPD_FAULT);
+ }
+ spin_unlock_irqrestore(&ctx->epd_lock, flags);
+}
+
 static irqreturn_t lcdifv3_crtc_vblank_irq_handler(int irq, void *dev_id)
 {
 	struct lcdifv3_crtc *lcdifv3_crtc = dev_id;
 	struct lcdifv3_soc *lcdifv3 = dev_get_drvdata(lcdifv3_crtc->dev->parent);
 
-	drm_crtc_handle_vblank(&lcdifv3_crtc->base);
-
-	lcdifv3_vblank_irq_clear(lcdifv3);
+ u32 status = lcdifv3_irq_status(lcdifv3);
+ struct drm_crtc *crtc = &lcdifv3_crtc->base;
+ if (!status) return IRQ_NONE;
+ if (status & BIT(2)) {
+  drm_crtc_handle_vblank(crtc);
+  spin_lock(&crtc->dev->event_lock);
+  if (lcdifv3_crtc->pending_event && !lcdifv3_shadow_pending(lcdifv3)) {
+   drm_crtc_send_vblank_event(crtc, lcdifv3_crtc->pending_event);
+   lcdifv3_crtc->pending_event = NULL;
+   drm_crtc_vblank_put(crtc);
+  }
+  spin_unlock(&crtc->dev->event_lock);
+ }
+ lcdifv3_epd_tick(lcdifv3_crtc, status);
+ lcdifv3_irq_ack(lcdifv3, status);
 
 	return IRQ_HANDLED;
 }
@@ -335,7 +399,10 @@ static int lcdifv3_crtc_bind(struct device *dev, struct device *master,
 static void lcdifv3_crtc_unbind(struct device *dev, struct device *master,
 			      void *data)
 {
-	/* No special to be done */
+ struct lcdifv3_crtc *ctx = dev_get_drvdata(dev);
+ lcdifv3_epd_force_stop(ctx);
+ flush_work(&ctx->epd_release);
+ cancel_delayed_work_sync(&ctx->epd_watchdog);
 }
 
 static const struct component_ops lcdifv3_crtc_ops = {
@@ -360,6 +427,10 @@ static int lcdifv3_crtc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	lcdifv3_crtc->dev = dev;
+ spin_lock_init(&lcdifv3_crtc->epd_lock);
+ INIT_WORK(&lcdifv3_crtc->epd_release, lcdifv3_epd_release_work);
+ INIT_DELAYED_WORK(&lcdifv3_crtc->epd_watchdog, lcdifv3_epd_watchdog);
+ lcdifv3_crtc->epd_opt_in = of_property_read_bool(dev->parent->of_node, "inkwell,finite-scanout");
 	dev_set_drvdata(dev, lcdifv3_crtc);
 
 	return component_add(dev, &lcdifv3_crtc_ops);
