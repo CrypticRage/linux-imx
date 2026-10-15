@@ -19,7 +19,7 @@
 #define IMX_EPD_DONE 2
 #define IMX_EPD_ABORTED 3
 #define IMX_EPD_FAULT 4
-#define IMX_EPD_MAX_PHASES 32
+#define IMX_EPD_MAX_PHASES 256
 #define IMX_EPD_MAX_SCANS 256
 struct drm_imx_epd_phase { __u32 fb_id; __u32 scans; };
 struct drm_imx_epd_sequence {

@@ -216,7 +216,7 @@ static int lcdifv3_epd_fb(struct drm_device *drm, struct drm_file *owner, u32 id
 int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner)
 {
 	struct drm_imx_epd_sequence *arg = data;
-	struct drm_imx_epd_phase phases[IMX_EPD_MAX_PHASES];
+	struct drm_imx_epd_phase *phases = NULL;
 	struct lcdifv3_crtc *ctx = NULL;
 	struct lcdifv3_epd_plan *p = NULL;
 	struct drm_crtc *crtc;
@@ -257,12 +257,16 @@ int lcdifv3_epd_ioctl(struct drm_device *drm, void *data, struct drm_file *owner
 	}
 	if (!arg->num_phases || arg->num_phases > IMX_EPD_MAX_PHASES || arg->lock_fd < 0)
 		return -EINVAL;
-	if (copy_from_user(phases, u64_to_user_ptr(arg->phases_ptr),
-			   arg->num_phases * sizeof(phases[0])))
-		return -EFAULT;
+	/* Too large for the stack at the full phase count. */
+	phases = memdup_array_user(u64_to_user_ptr(arg->phases_ptr), arg->num_phases,
+				   sizeof(*phases));
+	if (IS_ERR(phases))
+		return PTR_ERR(phases);
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
-	if (!p)
+	if (!p) {
+		kfree(phases);
 		return -ENOMEM;
+	}
 	p->phases = arg->num_phases;
 	p->active = -1;
 	p->lock_file = fget(arg->lock_fd);
@@ -357,6 +361,7 @@ unlock:
 	drm_modeset_unlock_all(drm);
 free:
 	lcdifv3_epd_free(ctx, p);
+	kfree(phases);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(lcdifv3_epd_ioctl);
